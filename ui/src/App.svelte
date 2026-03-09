@@ -114,6 +114,16 @@
                     <i class="ri-line-chart-line" />
                 </a>
                 <a
+                    href="/cluster"
+                    class="menu-item"
+                    aria-label="Cluster"
+                    use:link
+                    use:active={{ path: "/cluster/?.*", className: "current-route" }}
+                    use:tooltip={{ text: "Cluster", position: "right" }}
+                >
+                    <i class="ri-node-tree" />
+                </a>
+                <a
                     href="/settings"
                     class="menu-item"
                     aria-label="Settings"

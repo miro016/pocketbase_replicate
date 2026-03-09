@@ -1,5 +1,6 @@
 import PageIndex from "@/components/PageIndex.svelte";
 import PageLogs from "@/components/logs/PageLogs.svelte";
+import PageCluster from "@/components/cluster/PageCluster.svelte";
 import PageRecords from "@/components/records/PageRecords.svelte";
 import PageApplication from "@/components/settings/PageApplication.svelte";
 import PageBackups from "@/components/settings/PageBackups.svelte";
@@ -48,6 +49,12 @@ const routes = {
 
     "/logs": wrap({
         component: PageLogs,
+        conditions: [(_) => ApiClient.authStore.isValid],
+        userData: { showAppSidebar: true },
+    }),
+
+    "/cluster": wrap({
+        component: PageCluster,
         conditions: [(_) => ApiClient.authStore.isValid],
         userData: { showAppSidebar: true },
     }),
