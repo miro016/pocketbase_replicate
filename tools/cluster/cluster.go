@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -282,7 +283,7 @@ func (m *Manager) Broadcast(event *ReplicationEvent) {
 			// performs a delta sync to recover the dropped events.
 			m.logger.Warn("[cluster] SSE client buffer full, forcing reconnect for delta sync",
 				"peer", c.nodeID)
-			go c.forceClose()
+			c.forceClose()
 		}
 	}
 }
@@ -316,7 +317,7 @@ func (m *Manager) BroadcastToOne(nodeID string, event *ReplicationEvent) {
 	case c.ch <- line:
 	default:
 		m.logger.Warn("[cluster] SSE client buffer full, forcing reconnect", "peer", nodeID)
-		go c.forceClose()
+		c.forceClose()
 	}
 }
 
@@ -415,8 +416,9 @@ func (m *Manager) Nodes() []NodeInfo {
 
 	for peerURL, pc := range m.peerConns {
 		pc.mu.Lock()
+		nodeID := pc.nodeID
 		info := NodeInfo{
-			ID:          pc.nodeID,
+			ID:          nodeID,
 			Addr:        peerURL,
 			ConnectedAt: pc.connectedAt,
 			Status:      pc.status,
@@ -425,10 +427,11 @@ func (m *Manager) Nodes() []NodeInfo {
 		// Only deduplicate by nodeID when the peer is identified (connected).
 		// Reconnecting peers (nodeID=="") always appear individually by URL so
 		// all configured peers are visible in the admin UI. (Fix #4)
-		if info.ID != "" {
-			if _, ok := seen[info.ID]; ok {
+		if nodeID != "" {
+			if _, ok := seen[nodeID]; ok {
 				continue
 			}
+			seen[nodeID] = struct{}{}
 		}
 		nodes = append(nodes, info)
 	}
@@ -516,10 +519,12 @@ func (m *Manager) maintainPeerConnection(peerBaseURL string) {
 			m.logger.Warn("[cluster] peer connection failed, retrying",
 				"peer", peerBaseURL, "error", err, "backoff", backoff)
 
+			// Add jitter (±25%) to prevent thundering-herd reconnection storms.
+			jitter := time.Duration(float64(backoff) * (0.75 + rand.Float64()*0.5))
 			select {
 			case <-m.stopCh:
 				return
-			case <-time.After(backoff):
+			case <-time.After(jitter):
 			}
 
 			backoff *= 2
@@ -630,7 +635,7 @@ func (m *Manager) connectToPeer(peerBaseURL string, pc *peerConn) error {
 	m.mu.Unlock()
 
 	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024) // start 64KB, max 8MB per SSE event
 
 	var eventType string
 	var dataBuf bytes.Buffer

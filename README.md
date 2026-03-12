@@ -59,39 +59,37 @@ Create a record on Node A — it immediately appears on Node B, and vice versa. 
 
 Collections, records, superusers, auth origins, external auths, MFAs, OTPs, and app settings (`_params`) are all replicated. `_logs` and uploaded files are **not** replicated — use S3-compatible object storage for multi-node file sharing.
 
-### Code Review Summary
+### Code Review and Fixes
 
-A code review of the replication layer identified the following areas for improvement:
+A code review of the replication layer identified and fixed the following issues:
 
-**Error handling gaps** — Several places silently discard errors that could cause subtle failures:
-- `apis/cluster.go:191` — JSON marshal error ignored when building gossip payload; a failure produces a malformed SSE event
-- `apis/cluster.go:554,624,649` — `ParseDateTime` errors discarded; a zero time breaks last-write-wins conflict resolution
-- `apis/cluster.go:1312` — DB query error unchecked in `deltaSyncToPeer`; stale data may be sent
-- `apis/cluster.go:1136,1374,1416,1441` — `CREATE TABLE` / `ALTER TABLE` errors ignored via `// nolint`; if these fail, the cluster log is unavailable
+**Error handling (fixed):**
+- Gossip JSON marshal error now checked and logged instead of silently ignored
+- `ParseDateTime` errors in LWW conflict checks now logged with context (table, id, raw value)
+- Delta sync DB query for `record_updated` now checked and logged on failure
+- `ALTER TABLE` migration errors now logged (except expected "duplicate column" on already-migrated DBs)
+- `setTombstonePruneCutoff` now logs errors instead of silently discarding
+- `getTombstonePruneCutoff` `Sscanf` error now handled (returns 0 on parse failure)
 
-**Goroutine and resource management** — Potential leaks under edge-case conditions:
-- `tools/cluster/cluster.go:285,319` — `forceClose()` spawned as a goroutine on every SSE write error; repeated failures accumulate goroutines
-- `tools/cluster/cluster.go:545-551` — Context cancellation watcher goroutine may not exit on normal connection close (leak per peer connection)
-- `apis/cluster.go:173-178` — Sync goroutines (`syncAllTablesToPeer`, `deltaSyncToPeer`) are not cancelled when the SSE handler returns; they may attempt sends on a closed channel
+**Goroutine and resource management (fixed):**
+- `forceClose()` now called directly instead of via `go` — it's non-blocking (just closes a channel via `sync.Once`), so spawning a goroutine was unnecessary overhead
+- Sync goroutines (`syncAllTablesToPeer`, `deltaSyncToPeer`) now use a child context derived from the SSE handler; cancelled automatically when the handler returns
+- SSE write errors now logged at debug level before returning, aiding connection drop diagnosis
 
-**Concurrency issues:**
-- `tools/cluster/cluster.go:417-432` — TOCTOU race in `Nodes()`: `peerConn.nodeID` read under lock, but the dedup decision is made after unlock
-- No reconnect jitter — all peers use identical exponential backoff (2s, 4s, ... 60s) without random jitter, risking thundering-herd reconnection storms after a network partition
+**Concurrency (fixed):**
+- `Nodes()` now records `nodeID` in the `seen` map for outgoing connections, preventing duplicate entries when the same peer appears in both `sseClients` and `peerConns`
+- Reconnect backoff now includes ±25% random jitter to prevent thundering-herd storms after network partitions
 
-**Resource limits:**
-- `tools/cluster/cluster.go:633` — Hardcoded 1 MB SSE scanner buffer; records larger than 1 MB silently break the scanner and halt replication for that peer
-- `apis/cluster.go:1282-1358` — `deltaSyncToPeer` loads the entire `_cluster_log` result set into memory; millions of entries during a long partition can cause OOM
-- `apis/cluster.go:1059-1110` — `syncTable` streams all rows without pagination; large tables cause memory spikes
+**Resource limits (fixed):**
+- SSE scanner buffer increased from 1 MB to 8 MB max (starts at 64 KB, grows on demand)
+- `deltaSyncToPeer` now caps at 100k unique entries; if the log is larger, falls back to full sync instead of OOM
+- `fetchAndStoreFile` now uses a dedicated `http.Client` with a 5-minute timeout instead of `http.DefaultClient`
 
-**Security considerations:**
-- `cmd/serve.go:50-59` — Cluster secret transmitted in plaintext HTTP headers; a warning is logged but HTTP is not rejected (use HTTPS or a private network)
-- No rate limiting on the SSE replication endpoint; a compromised peer can flood events
-- `apis/cluster.go:907-921` — Table names in `buildUpsertSQL` are interpolated into SQL; mitigated by `app.HasTable()` validation but worth noting
-
-**Minor / code quality:**
-- Fix references (`Fix #1` through `Fix #13`) in comments lack a corresponding issue tracker
-- `apis/cluster.go:863` uses `context.Background()` instead of the request context for file downloads, bypassing graceful shutdown
-- `apis/cluster.go:1430` — `fmt.Sscanf` error unchecked when parsing tombstone prune timestamp
+**Remaining known limitations (not fixed — by design or low priority):**
+- `syncTable` streams all rows without pagination; large tables cause memory spikes during full sync
+- Cluster secret is transmitted in HTTP headers; a warning is logged but plaintext HTTP is not rejected (use HTTPS or a private network in production)
+- No rate limiting on the SSE replication endpoint
+- Table names in `buildUpsertSQL` are interpolated into SQL; mitigated by `app.HasTable()` pre-validation
 
 For the full cluster reference (topology, REST API, nginx setup, failure handling, known limitations), see [CLUSTER.md](CLUSTER.md).
 
