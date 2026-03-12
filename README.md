@@ -23,6 +23,80 @@
 > Please keep in mind that PocketBase is still under active development
 > and therefore full backward compatibility is not guaranteed before reaching v1.0.0.
 
+---
+
+## Cluster Replication (Fork Addition)
+
+This fork adds **active-active multi-node replication** to PocketBase. Any node can accept writes; changes propagate to all peers in near-real-time via Server-Sent Events (SSE). No external dependencies are introduced — the entire feature uses only the Go standard library.
+
+| Property | Value |
+|---|---|
+| Transport | SSE over HTTP/HTTPS |
+| Replication model | Active-active (multi-master) |
+| Conflict resolution | Last-write-wins (`updated` timestamp) |
+| Peer discovery | Gossip (automatic full-mesh formation) |
+| New dependencies | None |
+
+### Quick Start
+
+```bash
+# Node A
+./pocketbase serve --http=:8090 \
+  --cluster-secret=my-secret \
+  --cluster-self-url=http://node-a:8090 \
+  --cluster-peers=http://node-b:8091
+
+# Node B
+./pocketbase serve --http=:8091 \
+  --cluster-secret=my-secret \
+  --cluster-self-url=http://node-b:8091 \
+  --cluster-peers=http://node-a:8090
+```
+
+Create a record on Node A — it immediately appears on Node B, and vice versa. With `--cluster-self-url` set, gossip automatically forms a full mesh when adding more nodes (each new node only needs to know one existing peer).
+
+### What Gets Replicated
+
+Collections, records, superusers, auth origins, external auths, MFAs, OTPs, and app settings (`_params`) are all replicated. `_logs` and uploaded files are **not** replicated — use S3-compatible object storage for multi-node file sharing.
+
+### Code Review Summary
+
+A code review of the replication layer identified the following areas for improvement:
+
+**Error handling gaps** — Several places silently discard errors that could cause subtle failures:
+- `apis/cluster.go:191` — JSON marshal error ignored when building gossip payload; a failure produces a malformed SSE event
+- `apis/cluster.go:554,624,649` — `ParseDateTime` errors discarded; a zero time breaks last-write-wins conflict resolution
+- `apis/cluster.go:1312` — DB query error unchecked in `deltaSyncToPeer`; stale data may be sent
+- `apis/cluster.go:1136,1374,1416,1441` — `CREATE TABLE` / `ALTER TABLE` errors ignored via `// nolint`; if these fail, the cluster log is unavailable
+
+**Goroutine and resource management** — Potential leaks under edge-case conditions:
+- `tools/cluster/cluster.go:285,319` — `forceClose()` spawned as a goroutine on every SSE write error; repeated failures accumulate goroutines
+- `tools/cluster/cluster.go:545-551` — Context cancellation watcher goroutine may not exit on normal connection close (leak per peer connection)
+- `apis/cluster.go:173-178` — Sync goroutines (`syncAllTablesToPeer`, `deltaSyncToPeer`) are not cancelled when the SSE handler returns; they may attempt sends on a closed channel
+
+**Concurrency issues:**
+- `tools/cluster/cluster.go:417-432` — TOCTOU race in `Nodes()`: `peerConn.nodeID` read under lock, but the dedup decision is made after unlock
+- No reconnect jitter — all peers use identical exponential backoff (2s, 4s, ... 60s) without random jitter, risking thundering-herd reconnection storms after a network partition
+
+**Resource limits:**
+- `tools/cluster/cluster.go:633` — Hardcoded 1 MB SSE scanner buffer; records larger than 1 MB silently break the scanner and halt replication for that peer
+- `apis/cluster.go:1282-1358` — `deltaSyncToPeer` loads the entire `_cluster_log` result set into memory; millions of entries during a long partition can cause OOM
+- `apis/cluster.go:1059-1110` — `syncTable` streams all rows without pagination; large tables cause memory spikes
+
+**Security considerations:**
+- `cmd/serve.go:50-59` — Cluster secret transmitted in plaintext HTTP headers; a warning is logged but HTTP is not rejected (use HTTPS or a private network)
+- No rate limiting on the SSE replication endpoint; a compromised peer can flood events
+- `apis/cluster.go:907-921` — Table names in `buildUpsertSQL` are interpolated into SQL; mitigated by `app.HasTable()` validation but worth noting
+
+**Minor / code quality:**
+- Fix references (`Fix #1` through `Fix #13`) in comments lack a corresponding issue tracker
+- `apis/cluster.go:863` uses `context.Background()` instead of the request context for file downloads, bypassing graceful shutdown
+- `apis/cluster.go:1430` — `fmt.Sscanf` error unchecked when parsing tombstone prune timestamp
+
+For the full cluster reference (topology, REST API, nginx setup, failure handling, known limitations), see [CLUSTER.md](CLUSTER.md).
+
+---
+
 ## API SDK clients
 
 The easiest way to interact with the PocketBase Web APIs is to use one of the official SDK clients:
