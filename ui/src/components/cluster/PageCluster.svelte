@@ -48,6 +48,27 @@
         if (status === "reconnecting") return "badge-warning";
         return "badge-danger";
     }
+
+    function formatClockSkew(ms) {
+        if (ms === undefined || ms === null || ms === 0) return "—";
+        const abs = Math.abs(ms);
+        const sign = ms > 0 ? "+" : "-";
+        if (abs < 1000) return sign + abs + "ms";
+        return sign + (abs / 1000).toFixed(1) + "s";
+    }
+
+    function clockSkewClass(ms) {
+        if (ms === undefined || ms === null) return "";
+        const abs = Math.abs(ms);
+        if (abs > 5000) return "txt-danger";
+        if (abs > 1000) return "txt-warning";
+        return "";
+    }
+
+    // Check if any peer has significant clock skew (>1s)
+    $: hasClockSkewWarning = clusterInfo.nodes?.some(
+        (n) => n.clockSkewMs && Math.abs(n.clockSkewMs) > 1000
+    );
 </script>
 
 <PageWrapper>
@@ -96,6 +117,22 @@
             </div>
         </div>
 
+        <!-- Clock skew warning -->
+        {#if hasClockSkewWarning}
+            <div class="alert alert-warning m-b-base">
+                <div class="icon">
+                    <i class="ri-alarm-warning-line" />
+                </div>
+                <div class="content">
+                    <p>
+                        <strong>Clock skew detected!</strong> One or more peers have a time difference
+                        greater than 1 second. This can cause incorrect conflict resolution (last-write-wins
+                        depends on synchronized clocks). Consider using NTP to synchronize node clocks.
+                    </p>
+                </div>
+            </div>
+        {/if}
+
         <!-- Connected peers -->
         <div class="section-title m-t-base">
             <span>
@@ -125,6 +162,8 @@
                             <th class="col-type-text col-field-nodeId">Node ID</th>
                             <th class="col-type-text col-field-addr">Address</th>
                             <th class="col-type-text col-field-status">Status</th>
+                            <th class="col-type-text col-field-clockSkew">Clock Skew</th>
+                            <th class="col-type-text col-field-lastAck">Last Ack Seq</th>
                             <th class="col-type-date col-field-connectedAt">Connected since</th>
                         </tr>
                     </thead>
@@ -141,6 +180,14 @@
                                     <span class="badge {statusClass(node.status)}">
                                         {node.status || "unknown"}
                                     </span>
+                                </td>
+                                <td class="col-type-text col-field-clockSkew">
+                                    <span class="{clockSkewClass(node.clockSkewMs)}">
+                                        {formatClockSkew(node.clockSkewMs)}
+                                    </span>
+                                </td>
+                                <td class="col-type-text col-field-lastAck">
+                                    <span class="txt-mono">{node.lastAckedSeq || "—"}</span>
                                 </td>
                                 <td class="col-type-date col-field-connectedAt">
                                     {formatDate(node.connectedAt)}
@@ -232,6 +279,21 @@
     .alert-info {
         background: color-mix(in srgb, var(--infoColor) 10%, transparent);
         border-color: color-mix(in srgb, var(--infoColor) 30%, transparent);
+    }
+    .alert-warning {
+        background: color-mix(in srgb, var(--warningColor) 10%, transparent);
+        border-color: color-mix(in srgb, var(--warningColor) 30%, transparent);
+    }
+    .alert-warning .icon {
+        color: var(--warningColor);
+    }
+    .txt-danger {
+        color: var(--dangerColor);
+        font-weight: 600;
+    }
+    .txt-warning {
+        color: var(--warningColor);
+        font-weight: 600;
     }
     .alert .icon {
         font-size: 1.2em;

@@ -145,6 +145,7 @@ func clusterEventsHandler(e *core.RequestEvent) error {
 	e.Response.Header().Set("Content-Type", "text/event-stream")
 	e.Response.Header().Set("Cache-Control", "no-store")
 	e.Response.Header().Set("X-Accel-Buffering", "no")
+	e.Response.Header().Set("X-Cluster-Server-Time", time.Now().UTC().Format(time.RFC3339Nano))
 
 	// Determine peer remote address
 	peerAddr := e.Request.Header.Get("X-Forwarded-For")
@@ -164,18 +165,23 @@ func clusterEventsHandler(e *core.RequestEvent) error {
 	}
 
 	ctx := e.Request.Context()
+	// Create a child context that is cancelled when this handler returns,
+	// so sync goroutines don't outlive the SSE connection.
+	syncCtx, syncCancel := context.WithCancel(ctx)
+	defer syncCancel()
+
 	if since, err := time.Parse(time.RFC3339Nano, e.Request.Header.Get("X-Cluster-Since")); err == nil {
 		// If the peer's last-seen time predates our tombstone prune cutoff, some
 		// tombstones may have been pruned that the peer never received.
 		// Fall back to a full sync so deleted records don't survive on the peer.
 		pruneCutoff := getTombstonePruneCutoff(e.App)
 		if pruneCutoff > 0 && since.UnixNano() < pruneCutoff {
-			go syncAllTablesToPeer(e.App, m, peerNodeID, ctx)
+			go syncAllTablesToPeer(e.App, m, peerNodeID, syncCtx)
 		} else {
-			go deltaSyncToPeer(e.App, m, peerNodeID, since, ctx)
+			go deltaSyncToPeer(e.App, m, peerNodeID, since, syncCtx)
 		}
 	} else {
-		go syncAllTablesToPeer(e.App, m, peerNodeID, ctx)
+		go syncAllTablesToPeer(e.App, m, peerNodeID, syncCtx)
 	}
 
 	// Send a hello ping so the peer knows we are alive
@@ -188,7 +194,11 @@ func clusterEventsHandler(e *core.RequestEvent) error {
 	// Gossip: send the connecting peer a list of all other known peer URLs so it
 	// can establish a full-mesh automatically (without pre-configuring every node).
 	if knownURLs := m.KnownPeerURLs(peerSelfURL); len(knownURLs) > 0 {
-		peersData, _ := json.Marshal(map[string][]string{"urls": knownURLs})
+		peersData, err := json.Marshal(map[string][]string{"urls": knownURLs})
+		if err != nil {
+			e.App.Logger().Warn("[cluster] failed to marshal gossip peers", "error", err)
+			return nil
+		}
 		peersMsg := append([]byte("event: peers\ndata: "), peersData...)
 		peersMsg = append(peersMsg, '\n', '\n')
 		if _, err := e.Response.Write(peersMsg); err != nil {
@@ -201,6 +211,11 @@ func clusterEventsHandler(e *core.RequestEvent) error {
 	// drop the idle SSE connection. (Fix #7)
 	pingTicker := time.NewTicker(30 * time.Second)
 	defer pingTicker.Stop()
+
+	// Ack ticker: periodically send an ack with our current seq so the peer can
+	// track delivery progress. Sent every 5 seconds to keep overhead low.
+	ackTicker := time.NewTicker(5 * time.Second)
+	defer ackTicker.Stop()
 
 	// Stream events until the peer disconnects, the manager force-closes this
 	// connection (buffer overflow → delta sync on reconnect), or we shut down.
@@ -215,11 +230,23 @@ func clusterEventsHandler(e *core.RequestEvent) error {
 				return nil
 			}
 			if _, err := e.Response.Write(data); err != nil {
+				e.App.Logger().Debug("[cluster] SSE write failed, peer disconnected",
+					"peer", peerNodeID, "error", err)
 				return nil
 			}
 			_ = rc.Flush()
 		case <-pingTicker.C:
 			if _, err := e.Response.Write([]byte(": ping\n\n")); err != nil {
+				e.App.Logger().Debug("[cluster] SSE ping write failed, peer disconnected",
+					"peer", peerNodeID, "error", err)
+				return nil
+			}
+			_ = rc.Flush()
+		case <-ackTicker.C:
+			// Send our current processed seq back to the peer as an ack event.
+			seq := m.CurrentSeq()
+			ackMsg := []byte(fmt.Sprintf("event: ack\ndata: {\"seq\":%d}\n\n", seq))
+			if _, err := e.Response.Write(ackMsg); err != nil {
 				return nil
 			}
 			_ = rc.Flush()
@@ -551,8 +578,11 @@ func applyCollectionReplication(app core.App, event *cluster.ReplicationEvent) {
 		// LWW: if the event carries the deleted collection's updated timestamp,
 		// skip if our local collection was updated more recently. (Fix #1)
 		if rawUpdated, ok := event.RawData["updated"]; ok {
-			incomingUpdated, _ := types.ParseDateTime(rawUpdated)
-			if !incomingUpdated.IsZero() && incomingUpdated.Before(col.Updated) {
+			incomingUpdated, parseErr := types.ParseDateTime(rawUpdated)
+			if parseErr != nil {
+				app.Logger().Warn("[cluster] failed to parse incoming updated timestamp for collection delete",
+					"id", event.ID, "raw", rawUpdated, "error", parseErr)
+			} else if !incomingUpdated.IsZero() && incomingUpdated.Before(col.Updated) {
 				return // local collection is newer — skip delete
 			}
 		}
@@ -621,8 +651,11 @@ func applyRecordOrRawReplication(app core.App, event *cluster.ReplicationEvent) 
 		// LWW: if the event carries the deleted record's updated timestamp,
 		// skip if our local record was updated more recently. (Fix #1)
 		if rawUpdated, ok := event.RawData["updated"]; ok {
-			incomingUpdated, _ := types.ParseDateTime(rawUpdated)
-			if !incomingUpdated.IsZero() && incomingUpdated.Before(record.GetDateTime("updated")) {
+			incomingUpdated, parseErr := types.ParseDateTime(rawUpdated)
+			if parseErr != nil {
+				app.Logger().Warn("[cluster] failed to parse incoming updated timestamp for record delete",
+					"table", event.Table, "id", event.ID, "raw", rawUpdated, "error", parseErr)
+			} else if !incomingUpdated.IsZero() && incomingUpdated.Before(record.GetDateTime("updated")) {
 				return // local record is newer — skip delete
 			}
 		}
@@ -646,13 +679,24 @@ func applyRecordOrRawReplication(app core.App, event *cluster.ReplicationEvent) 
 		// discarded and record.GetDateTime("updated") would always return zero.
 		var incomingUpdated types.DateTime
 		if rawUpdated, ok := event.RawData["updated"]; ok {
-			incomingUpdated, _ = types.ParseDateTime(rawUpdated)
+			parsed, parseErr := types.ParseDateTime(rawUpdated)
+			if parseErr != nil {
+				app.Logger().Warn("[cluster] failed to parse incoming updated timestamp",
+					"table", event.Table, "id", event.ID, "raw", rawUpdated, "error", parseErr)
+			} else {
+				incomingUpdated = parsed
+			}
 		}
 
 		existing, findErr := app.FindRecordById(collection, event.ID)
 		if findErr == nil {
 			// Record exists locally. Skip if local version is the same age or newer (last-write-wins).
 			if !incomingUpdated.After(existing.GetDateTime("updated")) {
+				// Record is up-to-date, but files may be missing (e.g. during resync).
+				// Trigger file sync anyway so we pull any files we don't have locally.
+				if event.OriginURL != "" {
+					go syncRecordFiles(app, collection, event)
+				}
 				return
 			}
 			record.MarkAsNotNew()
@@ -857,20 +901,23 @@ func syncRecordFiles(app core.App, collection *core.Collection, event *cluster.R
 	}
 }
 
+// clusterFileClient is a dedicated HTTP client for file replication,
+// isolated from the global http.DefaultClient to avoid shared state issues.
+var clusterFileClient = &http.Client{
+	Timeout: 5 * time.Minute,
+}
+
 // fetchAndStoreFile fetches a file from the originating node's /api/cluster/files endpoint
 // and stores it in the local filesystem.
 func fetchAndStoreFile(app core.App, fsys *filesystem.System, originURL, fileKey, secret string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
 	fetchURL := strings.TrimRight(originURL, "/") + "/api/cluster/files?path=" + url.QueryEscape(fileKey)
-	req, err := http.NewRequestWithContext(ctx, "GET", fetchURL, nil)
+	req, err := http.NewRequest("GET", fetchURL, nil)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("X-Cluster-Secret", secret)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := clusterFileClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("fetch: %w", err)
 	}
@@ -1056,22 +1103,71 @@ func syncCollectionSchemas(app core.App, send func(*cluster.ReplicationEvent)) {
 	}
 }
 
+// syncTablePageSize is the number of rows fetched per page during full sync.
+// Cursor-based pagination avoids loading the entire table into memory at once.
+const syncTablePageSize = 500
+
 // syncTable sends all rows from a single table as replication create events via send.
+// Uses cursor-based pagination (keyed on id) to bound memory usage for large tables.
 func syncTable(app core.App, send func(*cluster.ReplicationEvent), tableName string) {
+	lastID := ""
+	for {
+		rows, cols, nextLastID, err := syncTablePage(app, tableName, lastID)
+		if err != nil {
+			app.Logger().Warn("[cluster] sync: failed to query table page",
+				"table", tableName, "lastID", lastID, "error", err)
+			return
+		}
+
+		for _, row := range rows {
+			id, _ := row["id"].(string)
+			if id == "" {
+				continue
+			}
+			send(&cluster.ReplicationEvent{
+				Op:      cluster.OpCreate,
+				Table:   tableName,
+				ID:      id,
+				RawData: row,
+			})
+		}
+
+		if len(rows) < syncTablePageSize || nextLastID == "" {
+			break // last page
+		}
+		lastID = nextLastID
+		_ = cols // used internally
+	}
+}
+
+// syncTablePage fetches one page of rows from a table using cursor-based pagination.
+// Returns the rows as maps, column names, and the last id in this page (for the next cursor).
+func syncTablePage(app core.App, tableName, afterID string) ([]map[string]any, []string, string, error) {
+	var query string
+	params := dbx.Params{"limit": syncTablePageSize}
+	if afterID == "" {
+		query = "SELECT * FROM {{" + tableName + "}} ORDER BY id ASC LIMIT {:limit}"
+	} else {
+		query = "SELECT * FROM {{" + tableName + "}} WHERE id > {:afterID} ORDER BY id ASC LIMIT {:limit}"
+		params["afterID"] = afterID
+	}
+
 	sqlRows, err := app.NonconcurrentDB().
-		NewQuery("SELECT * FROM {{" + tableName + "}}").
+		NewQuery(query).
+		Bind(params).
 		Rows()
 	if err != nil {
-		app.Logger().Warn("[cluster] sync: failed to query table",
-			"table", tableName, "error", err)
-		return
+		return nil, nil, "", err
 	}
 	defer sqlRows.Close()
 
 	cols, err := sqlRows.Columns()
 	if err != nil {
-		return
+		return nil, nil, "", err
 	}
+
+	var results []map[string]any
+	var lastID string
 
 	for sqlRows.Next() {
 		values := make([]any, len(cols))
@@ -1084,7 +1180,6 @@ func syncTable(app core.App, send func(*cluster.ReplicationEvent), tableName str
 		}
 
 		data := make(map[string]any, len(cols))
-		id := ""
 		for i, col := range cols {
 			v := values[i]
 			if b, ok := v.([]byte); ok {
@@ -1092,21 +1187,16 @@ func syncTable(app core.App, send func(*cluster.ReplicationEvent), tableName str
 			}
 			data[col] = v
 			if col == "id" {
-				id, _ = v.(string)
+				if s, ok := v.(string); ok {
+					lastID = s
+				}
 			}
 		}
 
-		if id == "" {
-			continue
-		}
-
-		send(&cluster.ReplicationEvent{
-			Op:      cluster.OpCreate,
-			Table:   tableName,
-			ID:      id,
-			RawData: data,
-		})
+		results = append(results, data)
 	}
+
+	return results, cols, lastID, nil
 }
 
 // -----------------------------------------------------------------
@@ -1130,10 +1220,12 @@ func ensureClusterLogTable(app core.App) error {
 	}
 
 	// Migration: add record_updated column if it doesn't exist.
-	// "duplicate column name" is the expected error on already-migrated DBs — ignore it.
-	app.NonconcurrentDB().NewQuery(
+	// "duplicate column name" is the expected error on already-migrated DBs.
+	if _, err := app.NonconcurrentDB().NewQuery(
 		`ALTER TABLE ` + clusterLogTable + ` ADD COLUMN record_updated TEXT`,
-	).Execute() // nolint: intentionally ignore error
+	).Execute(); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		app.Logger().Warn("[cluster] failed to add record_updated column", "error", err)
+	}
 
 	if _, err := app.NonconcurrentDB().NewQuery(
 		`CREATE INDEX IF NOT EXISTS idx_cluster_log_created ON ` + clusterLogTable + ` (created)`,
@@ -1280,11 +1372,14 @@ func deltaSyncToPeer(app core.App, manager *cluster.Manager, peerNodeID string, 
 	}
 
 	// Scan into memory so we can close the cursor before doing per-row DB lookups.
+	// Cap at 100k entries to bound memory; if exceeded, fall back to full sync.
+	const maxDeltaEntries = 100_000
 	type entry struct{ table, id, op string }
 	type key struct{ table, id string }
 	var order []key
 	seen := make(map[key]bool)
 	latest := make(map[key]string) // key → latest op (ORDER BY created ASC so last write wins)
+	overflow := false
 
 	for rows.Next() {
 		var e entry
@@ -1293,12 +1388,23 @@ func deltaSyncToPeer(app core.App, manager *cluster.Manager, peerNodeID string, 
 		}
 		k := key{e.table, e.id}
 		if !seen[k] {
+			if len(order) >= maxDeltaEntries {
+				overflow = true
+				break
+			}
 			order = append(order, k)
 			seen[k] = true
 		}
 		latest[k] = e.op
 	}
 	rows.Close()
+
+	if overflow {
+		app.Logger().Warn("[cluster] delta sync log too large, falling back to full sync",
+			"peer", peerNodeID, "entries", len(order))
+		syncAllTablesToPeer(app, manager, peerNodeID, ctx)
+		return
+	}
 
 	for _, k := range order {
 		if ctx.Err() != nil {
@@ -1309,11 +1415,14 @@ func deltaSyncToPeer(app core.App, manager *cluster.Manager, peerNodeID string, 
 		if op == cluster.OpDelete {
 			// Include record_updated so the receiver can apply LWW on delete. (Fix #1)
 			var recordUpdated string
-			app.NonconcurrentDB().NewQuery(
+			if err := app.NonconcurrentDB().NewQuery(
 				`SELECT COALESCE(record_updated, '') FROM `+clusterLogTable+
 					` WHERE table_name={:table} AND record_id={:id} AND op='delete'`+
 					` ORDER BY created DESC LIMIT 1`,
-			).Bind(dbx.Params{"table": k.table, "id": k.id}).Row(&recordUpdated)
+			).Bind(dbx.Params{"table": k.table, "id": k.id}).Row(&recordUpdated); err != nil {
+				app.Logger().Debug("[cluster] delta sync: failed to read record_updated for delete",
+					"table", k.table, "id", k.id, "error", err)
+			}
 
 			var rawData map[string]any
 			if recordUpdated != "" {
@@ -1427,16 +1536,20 @@ func getTombstonePruneCutoff(app core.App) int64 {
 		return 0
 	}
 	var ns int64
-	fmt.Sscanf(value, "%d", &ns)
+	if _, err := fmt.Sscanf(value, "%d", &ns); err != nil {
+		return 0
+	}
 	return ns
 }
 
 // setTombstonePruneCutoff persists the tombstone prune cutoff to _cluster_meta.
 func setTombstonePruneCutoff(app core.App, cutoffNS int64) {
-	app.NonconcurrentDB().NewQuery(
+	if _, err := app.NonconcurrentDB().NewQuery(
 		`INSERT OR REPLACE INTO `+clusterMetaTable+` (key, value) VALUES ({:key}, {:value})`,
 	).Bind(dbx.Params{
 		"key":   metaKeyTombstoneCutoff,
 		"value": fmt.Sprint(cutoffNS),
-	}).Execute() // nolint: intentionally ignore error
+	}).Execute(); err != nil {
+		app.Logger().Warn("[cluster] failed to persist tombstone prune cutoff", "error", err)
+	}
 }
