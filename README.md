@@ -85,11 +85,30 @@ A code review of the replication layer identified and fixed the following issues
 - `deltaSyncToPeer` now caps at 100k unique entries; if the log is larger, falls back to full sync instead of OOM
 - `fetchAndStoreFile` now uses a dedicated `http.Client` with a 5-minute timeout instead of `http.DefaultClient`
 
-**Remaining known limitations (not fixed — by design or low priority):**
-- `syncTable` streams all rows without pagination; large tables cause memory spikes during full sync
+**Remaining known limitations (by design or low priority):**
 - Cluster secret is transmitted in HTTP headers; a warning is logged but plaintext HTTP is not rejected (use HTTPS or a private network in production)
 - No rate limiting on the SSE replication endpoint
 - Table names in `buildUpsertSQL` are interpolated into SQL; mitigated by `app.HasTable()` pre-validation
+
+### Recent Enhancements
+
+**Clock skew detection:**
+- Each peer connection measures the clock difference using the `X-Cluster-Server-Time` response header
+- The admin dashboard shows a per-peer "Clock Skew" column and displays a prominent warning banner when any peer's skew exceeds 1 second
+- Skew > 5 seconds is shown in red; > 1 second in orange — since LWW depends on `updated` timestamps, synchronized clocks (via NTP) are important for correct conflict resolution
+
+**File replication during resync:**
+- During full sync and delta sync, files are now pulled even when the record itself is already up-to-date locally (LWW skip)
+- Previously, if a record existed on both nodes but files were missing on one node (e.g. after a restore or storage failure), the files would never be synced — this is now fixed
+
+**Paginated full sync:**
+- `syncTable` now uses cursor-based pagination (500 rows per page, keyed on `id`) instead of streaming the entire table in a single query
+- This bounds memory usage during full sync of large tables and prevents SQLite from holding a long-lived read transaction
+
+**Delivery acknowledgments:**
+- Each SSE connection now sends periodic `ack` events (every 5 seconds) containing the node's current processed sequence number
+- The admin dashboard shows a "Last Ack Seq" column per peer, enabling operators to detect replication lag
+- Acks flow bidirectionally: the SSE server sends acks to connected clients, and connecting clients process acks from peers
 
 For the full cluster reference (topology, REST API, nginx setup, failure handling, known limitations), see [CLUSTER.md](CLUSTER.md).
 

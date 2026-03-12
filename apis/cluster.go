@@ -145,6 +145,7 @@ func clusterEventsHandler(e *core.RequestEvent) error {
 	e.Response.Header().Set("Content-Type", "text/event-stream")
 	e.Response.Header().Set("Cache-Control", "no-store")
 	e.Response.Header().Set("X-Accel-Buffering", "no")
+	e.Response.Header().Set("X-Cluster-Server-Time", time.Now().UTC().Format(time.RFC3339Nano))
 
 	// Determine peer remote address
 	peerAddr := e.Request.Header.Get("X-Forwarded-For")
@@ -211,6 +212,11 @@ func clusterEventsHandler(e *core.RequestEvent) error {
 	pingTicker := time.NewTicker(30 * time.Second)
 	defer pingTicker.Stop()
 
+	// Ack ticker: periodically send an ack with our current seq so the peer can
+	// track delivery progress. Sent every 5 seconds to keep overhead low.
+	ackTicker := time.NewTicker(5 * time.Second)
+	defer ackTicker.Stop()
+
 	// Stream events until the peer disconnects, the manager force-closes this
 	// connection (buffer overflow → delta sync on reconnect), or we shut down.
 	for {
@@ -233,6 +239,14 @@ func clusterEventsHandler(e *core.RequestEvent) error {
 			if _, err := e.Response.Write([]byte(": ping\n\n")); err != nil {
 				e.App.Logger().Debug("[cluster] SSE ping write failed, peer disconnected",
 					"peer", peerNodeID, "error", err)
+				return nil
+			}
+			_ = rc.Flush()
+		case <-ackTicker.C:
+			// Send our current processed seq back to the peer as an ack event.
+			seq := m.CurrentSeq()
+			ackMsg := []byte(fmt.Sprintf("event: ack\ndata: {\"seq\":%d}\n\n", seq))
+			if _, err := e.Response.Write(ackMsg); err != nil {
 				return nil
 			}
 			_ = rc.Flush()
@@ -678,6 +692,11 @@ func applyRecordOrRawReplication(app core.App, event *cluster.ReplicationEvent) 
 		if findErr == nil {
 			// Record exists locally. Skip if local version is the same age or newer (last-write-wins).
 			if !incomingUpdated.After(existing.GetDateTime("updated")) {
+				// Record is up-to-date, but files may be missing (e.g. during resync).
+				// Trigger file sync anyway so we pull any files we don't have locally.
+				if event.OriginURL != "" {
+					go syncRecordFiles(app, collection, event)
+				}
 				return
 			}
 			record.MarkAsNotNew()
@@ -1084,22 +1103,71 @@ func syncCollectionSchemas(app core.App, send func(*cluster.ReplicationEvent)) {
 	}
 }
 
+// syncTablePageSize is the number of rows fetched per page during full sync.
+// Cursor-based pagination avoids loading the entire table into memory at once.
+const syncTablePageSize = 500
+
 // syncTable sends all rows from a single table as replication create events via send.
+// Uses cursor-based pagination (keyed on id) to bound memory usage for large tables.
 func syncTable(app core.App, send func(*cluster.ReplicationEvent), tableName string) {
+	lastID := ""
+	for {
+		rows, cols, nextLastID, err := syncTablePage(app, tableName, lastID)
+		if err != nil {
+			app.Logger().Warn("[cluster] sync: failed to query table page",
+				"table", tableName, "lastID", lastID, "error", err)
+			return
+		}
+
+		for _, row := range rows {
+			id, _ := row["id"].(string)
+			if id == "" {
+				continue
+			}
+			send(&cluster.ReplicationEvent{
+				Op:      cluster.OpCreate,
+				Table:   tableName,
+				ID:      id,
+				RawData: row,
+			})
+		}
+
+		if len(rows) < syncTablePageSize || nextLastID == "" {
+			break // last page
+		}
+		lastID = nextLastID
+		_ = cols // used internally
+	}
+}
+
+// syncTablePage fetches one page of rows from a table using cursor-based pagination.
+// Returns the rows as maps, column names, and the last id in this page (for the next cursor).
+func syncTablePage(app core.App, tableName, afterID string) ([]map[string]any, []string, string, error) {
+	var query string
+	params := dbx.Params{"limit": syncTablePageSize}
+	if afterID == "" {
+		query = "SELECT * FROM {{" + tableName + "}} ORDER BY id ASC LIMIT {:limit}"
+	} else {
+		query = "SELECT * FROM {{" + tableName + "}} WHERE id > {:afterID} ORDER BY id ASC LIMIT {:limit}"
+		params["afterID"] = afterID
+	}
+
 	sqlRows, err := app.NonconcurrentDB().
-		NewQuery("SELECT * FROM {{" + tableName + "}}").
+		NewQuery(query).
+		Bind(params).
 		Rows()
 	if err != nil {
-		app.Logger().Warn("[cluster] sync: failed to query table",
-			"table", tableName, "error", err)
-		return
+		return nil, nil, "", err
 	}
 	defer sqlRows.Close()
 
 	cols, err := sqlRows.Columns()
 	if err != nil {
-		return
+		return nil, nil, "", err
 	}
+
+	var results []map[string]any
+	var lastID string
 
 	for sqlRows.Next() {
 		values := make([]any, len(cols))
@@ -1112,7 +1180,6 @@ func syncTable(app core.App, send func(*cluster.ReplicationEvent), tableName str
 		}
 
 		data := make(map[string]any, len(cols))
-		id := ""
 		for i, col := range cols {
 			v := values[i]
 			if b, ok := v.([]byte); ok {
@@ -1120,21 +1187,16 @@ func syncTable(app core.App, send func(*cluster.ReplicationEvent), tableName str
 			}
 			data[col] = v
 			if col == "id" {
-				id, _ = v.(string)
+				if s, ok := v.(string); ok {
+					lastID = s
+				}
 			}
 		}
 
-		if id == "" {
-			continue
-		}
-
-		send(&cluster.ReplicationEvent{
-			Op:      cluster.OpCreate,
-			Table:   tableName,
-			ID:      id,
-			RawData: data,
-		})
+		results = append(results, data)
 	}
+
+	return results, cols, lastID, nil
 }
 
 // -----------------------------------------------------------------

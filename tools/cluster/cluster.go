@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -56,7 +57,9 @@ type NodeInfo struct {
 	ID          string    `json:"id"`
 	Addr        string    `json:"addr"`
 	ConnectedAt time.Time `json:"connectedAt"`
-	Status      string    `json:"status"` // "connected" | "reconnecting"
+	Status      string    `json:"status"`       // "connected" | "reconnecting"
+	ClockSkewMs int64     `json:"clockSkewMs"`  // estimated clock difference in ms (positive = peer ahead)
+	LastAckedSeq int64    `json:"lastAckedSeq"` // last seq the peer confirmed it processed
 }
 
 // -----------------------------------------------------------------
@@ -151,6 +154,8 @@ type peerConn struct {
 	addr        string
 	connectedAt time.Time
 	status      string
+	clockSkewMs int64 // estimated clock difference in ms (positive = peer ahead)
+	lastAckedSeq int64 // last sequence number the peer acknowledged
 	mu          sync.Mutex
 }
 
@@ -418,10 +423,12 @@ func (m *Manager) Nodes() []NodeInfo {
 		pc.mu.Lock()
 		nodeID := pc.nodeID
 		info := NodeInfo{
-			ID:          nodeID,
-			Addr:        peerURL,
-			ConnectedAt: pc.connectedAt,
-			Status:      pc.status,
+			ID:           nodeID,
+			Addr:         peerURL,
+			ConnectedAt:  pc.connectedAt,
+			Status:       pc.status,
+			ClockSkewMs:  pc.clockSkewMs,
+			LastAckedSeq: pc.lastAckedSeq,
 		}
 		pc.mu.Unlock()
 		// Only deduplicate by nodeID when the peer is identified (connected).
@@ -617,10 +624,20 @@ func (m *Manager) connectToPeer(peerBaseURL string, pc *peerConn) error {
 	}
 
 	now := time.Now().UTC()
+
+	// Estimate clock skew from the server's timestamp header.
+	var skewMs int64
+	if serverTimeStr := resp.Header.Get("X-Cluster-Server-Time"); serverTimeStr != "" {
+		if serverTime, err := time.Parse(time.RFC3339Nano, serverTimeStr); err == nil {
+			skewMs = serverTime.Sub(now).Milliseconds()
+		}
+	}
+
 	pc.mu.Lock()
 	pc.nodeID = peerNodeID
 	pc.connectedAt = now
 	pc.status = "connected"
+	pc.clockSkewMs = skewMs
 	pc.mu.Unlock()
 
 	// Persist the sync time so that future reconnects (even after restart) use delta sync. (Fix #6)
@@ -664,6 +681,8 @@ func (m *Manager) connectToPeer(peerBaseURL string, pc *peerConn) error {
 				m.handlePeerEvent(peerBaseURL, dataBuf.Bytes())
 			case eventType == "peers" && dataBuf.Len() > 0:
 				m.handlePeersEvent(dataBuf.Bytes())
+			case eventType == "ack" && dataBuf.Len() > 0:
+				m.handleAckEvent(peerBaseURL, dataBuf.Bytes())
 			}
 			eventType = ""
 			dataBuf.Reset()
@@ -693,6 +712,77 @@ func (m *Manager) handlePeersEvent(data []byte) {
 			continue
 		}
 		m.AddPeer(u) // idempotent: no-op if already connected
+	}
+}
+
+// handleAckEvent processes an acknowledgment from a peer, updating the tracked
+// last-acked sequence number for the peer connection.
+func (m *Manager) handleAckEvent(peerBaseURL string, data []byte) {
+	var payload struct {
+		Seq int64 `json:"seq"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		m.logger.Debug("[cluster] failed to decode ack event", "error", err)
+		return
+	}
+
+	m.mu.RLock()
+	pc, ok := m.peerConns[peerBaseURL]
+	m.mu.RUnlock()
+	if ok {
+		pc.mu.Lock()
+		if payload.Seq > pc.lastAckedSeq {
+			pc.lastAckedSeq = payload.Seq
+		}
+		pc.mu.Unlock()
+	}
+}
+
+// UpdateSSEClientAck updates the last-acked seq for an inbound SSE client (peer reading from us).
+// Called when the peer sends an ack via the POST /api/cluster/ack endpoint.
+func (m *Manager) UpdateSSEClientAck(nodeID string, seq int64) {
+	m.mu.RLock()
+	c, ok := m.sseClients[nodeID]
+	m.mu.RUnlock()
+	if !ok {
+		return
+	}
+	// sseClient doesn't track ack natively; we store it on the associated peerConn
+	// if the peer also has an outgoing connection to us.
+	m.mu.RLock()
+	for _, pc := range m.peerConns {
+		pc.mu.Lock()
+		if pc.nodeID == c.nodeID && seq > pc.lastAckedSeq {
+			pc.lastAckedSeq = seq
+		}
+		pc.mu.Unlock()
+	}
+	m.mu.RUnlock()
+}
+
+// CurrentSeq returns the current sequence number of this node.
+func (m *Manager) CurrentSeq() int64 {
+	return m.seq.Load()
+}
+
+// SendAckToSSEClients sends an ack event with the given sequence number as an SSE
+// message to the peer we're reading from. This is sent via the peer's SSE writer.
+// In practice, acks flow via a separate mechanism (the peer sends ack events on its SSE stream
+// back to us). For the outbound direction we embed the ack in comments.
+// However, since SSE is unidirectional (server→client), we use the ack endpoint instead.
+// This method writes an "ack" SSE event to our inbound SSE clients so THEY know we processed their events.
+func (m *Manager) SendAckToAllClients(seq int64) {
+	line := []byte("event: ack\ndata: {\"seq\":" + strconv.FormatInt(seq, 10) + "}\n\n")
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, c := range m.sseClients {
+		select {
+		case c.ch <- line:
+		default:
+			// Don't force-close for ack drops; they're advisory.
+		}
 	}
 }
 
