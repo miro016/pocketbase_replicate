@@ -739,3 +739,140 @@ func TestApplyReplication_EmptyEventIgnored(t *testing.T) {
 	apis.ApplyReplication(app, &cluster.ReplicationEvent{Op: cluster.OpCreate})
 	apis.ApplyReplication(app, &cluster.ReplicationEvent{Table: "demo1"})
 }
+
+// ---------------------------------------------------------------------------
+// Auth collection secret preservation during cluster replication
+// ---------------------------------------------------------------------------
+
+func TestMarshalCollectionForCluster_IncludesAuthSecrets(t *testing.T) {
+	app := newClusterApp(t)
+
+	// Find a system auth collection (_superusers).
+	col, err := app.FindCachedCollectionByNameOrId("_superusers")
+	if err != nil {
+		t.Fatal("FindCachedCollectionByNameOrId(_superusers):", err)
+	}
+
+	if !col.IsAuth() {
+		t.Fatal("_superusers should be an auth collection")
+	}
+
+	// Verify the collection has non-empty secrets.
+	if col.AuthToken.Secret == "" {
+		t.Fatal("_superusers AuthToken.Secret is empty before test; expected a non-empty secret")
+	}
+
+	// Marshal for cluster — should include secrets.
+	rawData, err := apis.TestMarshalCollectionForCluster(col)
+	if err != nil {
+		t.Fatal("marshalCollectionForCluster:", err)
+	}
+
+	// Check that authToken.secret is present and matches the original.
+	authTokenMap, ok := rawData["authToken"].(map[string]any)
+	if !ok {
+		t.Fatal("rawData[\"authToken\"] is missing or not a map")
+	}
+	secret, ok := authTokenMap["secret"].(string)
+	if !ok || secret == "" {
+		t.Fatal("authToken.secret is missing or empty in cluster-serialized data")
+	}
+	if secret != col.AuthToken.Secret {
+		t.Fatalf("authToken.secret mismatch: got %q, want %q", secret, col.AuthToken.Secret)
+	}
+
+	// Also check other token secrets.
+	for _, key := range []string{"fileToken", "passwordResetToken", "emailChangeToken", "verificationToken"} {
+		tkMap, ok := rawData[key].(map[string]any)
+		if !ok {
+			t.Errorf("rawData[%q] is missing or not a map", key)
+			continue
+		}
+		s, ok := tkMap["secret"].(string)
+		if !ok || s == "" {
+			t.Errorf("%s.secret is missing or empty in cluster-serialized data", key)
+		}
+	}
+
+	// Verify that standard json.Marshal blanks the secrets (baseline assertion).
+	stdJSON, _ := json.Marshal(col)
+	var stdData map[string]any
+	json.Unmarshal(stdJSON, &stdData)
+	if stdAuthToken, ok := stdData["authToken"].(map[string]any); ok {
+		if s, _ := stdAuthToken["secret"].(string); s != "" {
+			t.Fatal("standard json.Marshal should blank authToken.secret, but it was present")
+		}
+	}
+}
+
+func TestSyncCollectionSchemas_PreservesAuthSecretsOnPeer(t *testing.T) {
+	appA := newClusterApp(t)
+	appB := newClusterApp(t)
+
+	// Get the _superusers auth collection from A.
+	colA, err := appA.FindCachedCollectionByNameOrId("_superusers")
+	if err != nil {
+		t.Fatal("FindCachedCollectionByNameOrId(_superusers) on A:", err)
+	}
+	originalSecret := colA.AuthToken.Secret
+	if originalSecret == "" {
+		t.Fatal("_superusers AuthToken.Secret is empty on A")
+	}
+
+	// Sync all collection schemas from A to B.
+	send, events := collectSendEvents()
+	apis.TestSyncCollectionSchemas(appA, send)
+
+	for _, ev := range *events {
+		apis.ApplyReplication(appB, ev)
+	}
+
+	// Verify that B's _superusers collection has A's auth token secret.
+	colB, err := appB.FindCachedCollectionByNameOrId("_superusers")
+	if err != nil {
+		t.Fatal("FindCachedCollectionByNameOrId(_superusers) on B:", err)
+	}
+
+	if colB.AuthToken.Secret != originalSecret {
+		t.Fatalf("AuthToken.Secret mismatch after sync:\n  got  %q\n  want %q", colB.AuthToken.Secret, originalSecret)
+	}
+}
+
+func TestApplyCollectionReplication_AuthSecret_PreservedOnUpdate(t *testing.T) {
+	app := newClusterApp(t)
+
+	// Get the _superusers collection.
+	col, err := app.FindCachedCollectionByNameOrId("_superusers")
+	if err != nil {
+		t.Fatal("FindCachedCollectionByNameOrId:", err)
+	}
+	originalSecret := col.AuthToken.Secret
+	if originalSecret == "" {
+		t.Fatal("_superusers AuthToken.Secret is empty")
+	}
+
+	// Build a replication event with the correct secrets (as marshalCollectionForCluster would produce).
+	rawData, err := apis.TestMarshalCollectionForCluster(col)
+	if err != nil {
+		t.Fatal("marshalCollectionForCluster:", err)
+	}
+
+	// Set a future timestamp so LWW allows the update.
+	rawData["updated"] = time.Now().Add(time.Hour).UTC().Format("2006-01-02 15:04:05.999Z")
+
+	apis.ApplyReplication(app, &cluster.ReplicationEvent{
+		Op:      cluster.OpUpdate,
+		Table:   apis.TestCollectionsTableName,
+		ID:      col.Id,
+		RawData: rawData,
+	})
+
+	// Reload the collection and verify the secret is preserved.
+	reloaded, err := app.FindCachedCollectionByNameOrId(col.Id)
+	if err != nil {
+		t.Fatal("FindCachedCollectionByNameOrId after replication:", err)
+	}
+	if reloaded.AuthToken.Secret != originalSecret {
+		t.Fatalf("AuthToken.Secret changed after replication:\n  got  %q\n  want %q", reloaded.AuthToken.Secret, originalSecret)
+	}
+}
